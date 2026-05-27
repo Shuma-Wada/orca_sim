@@ -11,8 +11,84 @@ from orca_sim.versions import (
 )
 
 
+RENDER_FPS: int = 30
+
+
+# ---------------------------------------------------------------------------
+# orca_teleop compatibility bridge
+#
+# orca_teleop/sim.py expects env.hand to expose:
+#   - hand.config.joint_ids          : list[str]
+#   - hand.config.neutral_position   : dict[str, float]  (degrees)
+#   - hand.get_joint_position()      : object with .as_array(joint_ids) -> np.ndarray (radians)
+#
+# These thin proxy classes satisfy that interface using the MuJoCo model/data
+# that orca_sim already holds, without depending on orca_core.
+# ---------------------------------------------------------------------------
+
+class _HandConfig:
+    """Minimal hand config proxy for orca_teleop compatibility."""
+
+    def __init__(self, joint_ids: list[str], neutral_position: dict[str, float]) -> None:
+        self.joint_ids = joint_ids
+        self.neutral_position = neutral_position  # degrees
+
+
+class _JointPositions:
+    """Minimal joint-position proxy for orca_teleop compatibility."""
+
+    def __init__(self, positions: dict[str, float]) -> None:
+        self._positions = positions
+
+    def as_array(self, joint_ids: list[str]) -> np.ndarray:
+        return np.array([self._positions.get(jid, 0.0) for jid in joint_ids])
+
+
+class _HandProxy:
+    """Bridges env.hand expected by orca_teleop to orca_sim MuJoCo internals."""
+
+    def __init__(self, env: "BaseOrcaHandEnv") -> None:
+        self._env = env
+        # Actuator names follow the pattern "{side}_{joint_name}_actuator" (v1)
+        # or "{side}_{abbrev}_actuator" (v2). Strip the prefix/suffix to get
+        # logical joint names that match orca_core config.joint_ids.
+        raw_names = [
+            mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            for i in range(env.model.nu)
+        ]
+        joint_ids = [self._parse_actuator_name(n) for n in raw_names]
+        # Neutral position: 0 degrees for all joints
+        self.config = _HandConfig(joint_ids, {jid: 0.0 for jid in joint_ids})
+
+    @staticmethod
+    def _parse_actuator_name(name: str) -> str:
+        """Extract logical joint name from MuJoCo actuator name.
+
+        Pattern: ``{side}_{joint}_actuator`` → ``{joint}``
+        Example: ``left_thumb_mcp_actuator`` → ``thumb_mcp``
+        """
+        # Strip known suffix
+        if name.endswith("_actuator"):
+            name = name[: -len("_actuator")]
+        # Strip known side prefix
+        for prefix in ("left_", "right_"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        return name
+
+    def get_joint_position(self) -> _JointPositions:
+        """Return current actuator ctrl values (radians) as a _JointPositions."""
+        joint_ids = self.config.joint_ids
+        positions = {
+            jid: float(self._env.data.ctrl[i])
+            for i, jid in enumerate(joint_ids)
+        }
+        return _JointPositions(positions)
+
+
 class BaseOrcaHandEnv(gym.Env[np.ndarray, np.ndarray]):
-    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": RENDER_FPS}
 
     def __init__(
         self,
@@ -53,6 +129,13 @@ class BaseOrcaHandEnv(gym.Env[np.ndarray, np.ndarray]):
             shape=obs.shape,
             dtype=np.float64,
         )
+
+        # orca_teleop compatibility: expose env.hand interface
+        self._hand_proxy = _HandProxy(self)
+
+    @property
+    def hand(self) -> _HandProxy:
+        return self._hand_proxy
 
     def _get_obs(self) -> np.ndarray:
         return np.concatenate([self.data.qpos.copy(), self.data.qvel.copy()])
